@@ -1,0 +1,762 @@
+@echo off
+setlocal
+set "CLIPBOARD_PANEL_BAT=%~f0"
+
+where powershell.exe >nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] powershell.exe was not found on this Windows computer.
+    echo Clipboard Panel BAT requires Windows PowerShell.
+    pause
+    exit /b 1
+)
+
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -Command "$bat=$env:CLIPBOARD_PANEL_BAT; $marker='__CLIPBOARD_PANEL_POWERSHELL_PAYLOAD_BELOW__'; $content=Get-Content -LiteralPath $bat -Raw -Encoding UTF8; $idx=$content.LastIndexOf($marker); if($idx -lt 0){throw 'PowerShell payload marker not found.'}; $script=$content.Substring($idx + $marker.Length); Invoke-Expression $script"
+set "ERR=%ERRORLEVEL%"
+if not "%ERR%"=="0" (
+    echo.
+    echo [ERROR] Clipboard Panel failed. Exit code: %ERR%
+    pause
+)
+exit /b %ERR%
+
+__CLIPBOARD_PANEL_POWERSHELL_PAYLOAD_BELOW__
+# Clipboard Panel BAT edition
+# Runs without Python. Keep this .bat next to templates.json and add_button.png.
+
+$ErrorActionPreference = 'Stop'
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+$script:AppTitle = 'Clipboard Panel'
+$script:BatPath = $env:CLIPBOARD_PANEL_BAT
+$script:AppDir = Split-Path -Parent $script:BatPath
+$script:DataFile = Join-Path $script:AppDir 'templates.json'
+$script:AddIconFile = Join-Path $script:AppDir 'add_button.png'
+
+$script:ButtonSize = 80
+$script:CellGap = 12
+$script:DefaultGridColumns = 4
+$script:MaxGridColumns = 8
+$script:SingleClickDelayMs = 280
+
+$script:Templates = @()
+$script:CurrentGridColumns = $script:DefaultGridColumns
+$script:LastClickTemplateId = $null
+$script:LastClickTime = [DateTime]::MinValue
+$script:PendingClickItem = $null
+$script:AddButtonImage = $null
+
+function New-TemplateItem {
+    param(
+        [string]$Id,
+        [string]$Title,
+        [string]$Template
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Id)) {
+        $Id = [guid]::NewGuid().ToString()
+    }
+
+    [pscustomobject]@{
+        id       = [string]$Id
+        title    = [string]$Title
+        template = [string]$Template
+    }
+}
+
+function Show-InfoMessage {
+    param([string]$Message, [string]$Title = $script:AppTitle)
+    [System.Windows.Forms.MessageBox]::Show(
+        $Message,
+        $Title,
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Information
+    ) | Out-Null
+}
+
+function Show-WarningMessage {
+    param([string]$Message, [string]$Title = $script:AppTitle)
+    [System.Windows.Forms.MessageBox]::Show(
+        $Message,
+        $Title,
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Warning
+    ) | Out-Null
+}
+
+function Show-ErrorMessage {
+    param([string]$Message, [string]$Title = $script:AppTitle)
+    [System.Windows.Forms.MessageBox]::Show(
+        $Message,
+        $Title,
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error
+    ) | Out-Null
+}
+
+function Get-ObjectPropertyValue {
+    param(
+        [object]$Object,
+        [string]$Name,
+        [object]$DefaultValue = $null
+    )
+
+    if ($null -eq $Object) {
+        return $DefaultValue
+    }
+
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $DefaultValue
+    }
+
+    return $property.Value
+}
+
+function Load-Templates {
+    if (-not (Test-Path -LiteralPath $script:DataFile)) {
+        return @()
+    }
+
+    try {
+        $json = [System.IO.File]::ReadAllText($script:DataFile, [System.Text.Encoding]::UTF8)
+        if ([string]::IsNullOrWhiteSpace($json)) {
+            return @()
+        }
+
+        $raw = $json | ConvertFrom-Json
+        $rawItems = @()
+
+        if ($raw -is [System.Array]) {
+            $rawItems = $raw
+        }
+        elseif ($null -ne $raw -and $raw.PSObject.Properties['templates']) {
+            $rawItems = @($raw.templates)
+        }
+
+        $loadedItems = New-Object System.Collections.Generic.List[object]
+        foreach ($item in @($rawItems)) {
+            if ($null -eq $item) {
+                continue
+            }
+
+            $title = [string](Get-ObjectPropertyValue $item 'title' '')
+            $template = [string](Get-ObjectPropertyValue $item 'template' '')
+            $id = [string](Get-ObjectPropertyValue $item 'id' '')
+
+            $title = $title.Trim()
+            if (-not [string]::IsNullOrWhiteSpace($title) -and -not [string]::IsNullOrWhiteSpace($template)) {
+                $loadedItems.Add((New-TemplateItem -Id $id -Title $title -Template $template))
+            }
+        }
+
+        return @($loadedItems.ToArray())
+    }
+    catch {
+        Show-ErrorMessage "Could not read templates.json:`r`n$($_.Exception.Message)" 'JSON read error'
+        return @()
+    }
+}
+
+function Save-Templates {
+    try {
+        $items = @(
+            foreach ($item in @($script:Templates)) {
+                [ordered]@{
+                    id       = [string]$item.id
+                    title    = [string]$item.title
+                    template = [string]$item.template
+                }
+            }
+        )
+
+        $data = [ordered]@{
+            templates = $items
+        }
+
+        $json = $data | ConvertTo-Json -Depth 20
+        $utf8NoBom = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false
+        [System.IO.File]::WriteAllText($script:DataFile, $json, $utf8NoBom)
+    }
+    catch {
+        Show-ErrorMessage "Could not save templates.json:`r`n$($_.Exception.Message)" 'JSON write error'
+    }
+}
+
+function Set-Status {
+    param([string]$Message)
+    if ($null -ne $script:StatusLabel) {
+        $script:StatusLabel.Text = $Message
+    }
+}
+
+function Copy-Template {
+    param([object]$Item)
+
+    try {
+        [System.Windows.Forms.Clipboard]::SetText(
+            [string]$Item.template,
+            [System.Windows.Forms.TextDataFormat]::UnicodeText
+        )
+        Set-Status "Copied template: $($Item.title)"
+    }
+    catch {
+        Show-ErrorMessage "Could not copy to clipboard:`r`n$($_.Exception.Message)" 'Clipboard error'
+    }
+}
+
+function Get-GridColumns {
+    if ($null -eq $script:ScrollPanel) {
+        return $script:DefaultGridColumns
+    }
+
+    $width = $script:ScrollPanel.ClientSize.Width
+    if ($width -le 0) {
+        $width = $script:MainForm.ClientSize.Width
+    }
+
+    $cellWidth = $script:ButtonSize + $script:CellGap
+    $columns = [int][Math]::Floor($width / $cellWidth)
+    if ($columns -lt 1) {
+        $columns = 1
+    }
+    if ($columns -gt $script:MaxGridColumns) {
+        $columns = $script:MaxGridColumns
+    }
+    return $columns
+}
+
+function New-ScaledImage {
+    param(
+        [string]$Path,
+        [int]$Width,
+        [int]$Height
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $null
+    }
+
+    try {
+        $source = [System.Drawing.Image]::FromFile($Path)
+        try {
+            $bitmap = New-Object -TypeName System.Drawing.Bitmap -ArgumentList $Width, $Height
+            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+            try {
+                $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+                $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+                $graphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+                $graphics.Clear([System.Drawing.Color]::Transparent)
+                $graphics.DrawImage($source, 0, 0, $Width, $Height)
+            }
+            finally {
+                $graphics.Dispose()
+            }
+            return $bitmap
+        }
+        finally {
+            $source.Dispose()
+        }
+    }
+    catch {
+        return $null
+    }
+}
+
+function New-SquareCell {
+    param([int]$Row, [int]$Column)
+
+    $cell = New-Object System.Windows.Forms.Panel
+    $cell.Width = $script:ButtonSize
+    $cell.Height = $script:ButtonSize
+    $cell.Margin = New-Object -TypeName System.Windows.Forms.Padding -ArgumentList ([int]($script:CellGap / 2)), ([int]($script:CellGap / 2)), ([int]($script:CellGap / 2)), ([int]($script:CellGap / 2))
+    $cell.MinimumSize = New-Object -TypeName System.Drawing.Size -ArgumentList $script:ButtonSize, $script:ButtonSize
+    $cell.MaximumSize = New-Object -TypeName System.Drawing.Size -ArgumentList $script:ButtonSize, $script:ButtonSize
+
+    $script:GridTable.Controls.Add($cell, $Column, $Row)
+    return $cell
+}
+
+function Handle-TemplateClick {
+    param([object]$Item)
+
+    $now = Get-Date
+    $elapsedMs = ($now - $script:LastClickTime).TotalMilliseconds
+    $isDoubleClick = (
+        $script:LastClickTemplateId -eq $Item.id -and
+        $elapsedMs -le ($script:SingleClickDelayMs * 1.5)
+    )
+
+    if ($isDoubleClick) {
+        if ($null -ne $script:ClickTimer) {
+            $script:ClickTimer.Stop()
+        }
+        $script:PendingClickItem = $null
+        $script:LastClickTemplateId = $null
+        $script:LastClickTime = [DateTime]::MinValue
+        Open-EditDialog $Item
+        return
+    }
+
+    if ($null -ne $script:ClickTimer) {
+        $script:ClickTimer.Stop()
+    }
+
+    $script:LastClickTemplateId = $Item.id
+    $script:LastClickTime = $now
+    $script:PendingClickItem = $Item
+    $script:ClickTimer.Start()
+}
+
+function New-TemplateButton {
+    param(
+        [object]$Item,
+        [int]$Row,
+        [int]$Column
+    )
+
+    $cell = New-SquareCell -Row $Row -Column $Column
+
+    $button = New-Object System.Windows.Forms.Button
+    $button.Text = [string]$Item.title
+    $button.Tag = $Item
+    $button.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $button.BackColor = [System.Drawing.ColorTranslator]::FromHtml('#f4f7fb')
+    $button.FlatStyle = [System.Windows.Forms.FlatStyle]::Standard
+    $button.Font = New-Object -TypeName System.Drawing.Font -ArgumentList 'Segoe UI', 9
+    $button.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $button.UseVisualStyleBackColor = $false
+    $button.Add_MouseUp({
+        param($sender, $eventArgs)
+        if ($eventArgs.Button -ne [System.Windows.Forms.MouseButtons]::Left) {
+            return
+        }
+        Handle-TemplateClick $sender.Tag
+    })
+
+    $cell.Controls.Add($button)
+}
+
+function New-AddButton {
+    param(
+        [int]$Row,
+        [int]$Column
+    )
+
+    $cell = New-SquareCell -Row $Row -Column $Column
+
+    $button = New-Object System.Windows.Forms.Button
+    $button.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $button.BackColor = [System.Drawing.ColorTranslator]::FromHtml('#eef7ee')
+    $button.FlatStyle = [System.Windows.Forms.FlatStyle]::Standard
+    $button.UseVisualStyleBackColor = $false
+
+    if ($null -ne $script:AddButtonImage) {
+        $button.Image = $script:AddButtonImage
+        $button.ImageAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    }
+    else {
+        $button.Text = '+'
+        $button.Font = New-Object -TypeName System.Drawing.Font -ArgumentList 'Segoe UI', 26, ([System.Drawing.FontStyle]::Bold)
+        $button.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    }
+
+    $button.Add_Click({ Open-AddDialog })
+    $cell.Controls.Add($button)
+}
+
+function Render-Grid {
+    if ($null -eq $script:GridTable) {
+        return
+    }
+
+    $columns = Get-GridColumns
+    $script:CurrentGridColumns = $columns
+
+    $script:GridTable.SuspendLayout()
+    try {
+        $script:GridTable.Controls.Clear()
+        $script:GridTable.ColumnStyles.Clear()
+        $script:GridTable.RowStyles.Clear()
+
+        $totalItems = @($script:Templates).Count + 1
+        $rows = [int][Math]::Ceiling($totalItems / [double]$columns)
+        if ($rows -lt 1) {
+            $rows = 1
+        }
+
+        $script:GridTable.ColumnCount = $columns
+        $script:GridTable.RowCount = $rows
+        $script:GridTable.Width = $columns * ($script:ButtonSize + $script:CellGap)
+        $script:GridTable.Height = $rows * ($script:ButtonSize + $script:CellGap)
+
+        for ($col = 0; $col -lt $columns; $col++) {
+            $script:GridTable.ColumnStyles.Add(
+                (New-Object -TypeName System.Windows.Forms.ColumnStyle -ArgumentList ([System.Windows.Forms.SizeType]::Absolute), ($script:ButtonSize + $script:CellGap))
+            ) | Out-Null
+        }
+
+        for ($row = 0; $row -lt $rows; $row++) {
+            $script:GridTable.RowStyles.Add(
+                (New-Object -TypeName System.Windows.Forms.RowStyle -ArgumentList ([System.Windows.Forms.SizeType]::Absolute), ($script:ButtonSize + $script:CellGap))
+            ) | Out-Null
+        }
+
+        $index = 0
+        foreach ($item in @($script:Templates)) {
+            $row = [int][Math]::Floor($index / $columns)
+            $col = $index % $columns
+            New-TemplateButton -Item $item -Row $row -Column $col
+            $index++
+        }
+
+        $addRow = [int][Math]::Floor($index / $columns)
+        $addCol = $index % $columns
+        New-AddButton -Row $addRow -Column $addCol
+    }
+    finally {
+        $script:GridTable.ResumeLayout($true)
+    }
+}
+
+function Show-TemplateDialog {
+    param(
+        [string]$DialogTitle,
+        [string]$InitialTitle = '',
+        [string]$InitialTemplate = '',
+        [bool]$ShowDelete = $false,
+        [scriptblock]$OnSave,
+        [scriptblock]$OnDelete
+    )
+
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = $DialogTitle
+    $dialog.Size = New-Object -TypeName System.Drawing.Size -ArgumentList 520, 420
+    $dialog.MinimumSize = New-Object -TypeName System.Drawing.Size -ArgumentList 520, 420
+    $dialog.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $dialog.ShowInTaskbar = $false
+    $dialog.KeyPreview = $true
+
+    $root = New-Object System.Windows.Forms.TableLayoutPanel
+    $root.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $root.Padding = New-Object -TypeName System.Windows.Forms.Padding -ArgumentList 16
+    $root.ColumnCount = 1
+    $root.RowCount = 5
+    $root.ColumnStyles.Add((New-Object -TypeName System.Windows.Forms.ColumnStyle -ArgumentList ([System.Windows.Forms.SizeType]::Percent), 100)) | Out-Null
+    $root.RowStyles.Add((New-Object -TypeName System.Windows.Forms.RowStyle -ArgumentList ([System.Windows.Forms.SizeType]::Absolute), 22)) | Out-Null
+    $root.RowStyles.Add((New-Object -TypeName System.Windows.Forms.RowStyle -ArgumentList ([System.Windows.Forms.SizeType]::Absolute), 36)) | Out-Null
+    $root.RowStyles.Add((New-Object -TypeName System.Windows.Forms.RowStyle -ArgumentList ([System.Windows.Forms.SizeType]::Absolute), 22)) | Out-Null
+    $root.RowStyles.Add((New-Object -TypeName System.Windows.Forms.RowStyle -ArgumentList ([System.Windows.Forms.SizeType]::Percent), 100)) | Out-Null
+    $root.RowStyles.Add((New-Object -TypeName System.Windows.Forms.RowStyle -ArgumentList ([System.Windows.Forms.SizeType]::Absolute), 40)) | Out-Null
+    $dialog.Controls.Add($root)
+
+    $titleLabel = New-Object System.Windows.Forms.Label
+    $titleLabel.Text = 'Display name'
+    $titleLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $titleLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $root.Controls.Add($titleLabel, 0, 0)
+
+    $titleBox = New-Object System.Windows.Forms.TextBox
+    $titleBox.Text = $InitialTitle
+    $titleBox.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $root.Controls.Add($titleBox, 0, 1)
+
+    $templateLabel = New-Object System.Windows.Forms.Label
+    $templateLabel.Text = 'Template text'
+    $templateLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $templateLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $root.Controls.Add($templateLabel, 0, 2)
+
+    $templateBox = New-Object System.Windows.Forms.TextBox
+    $templateBox.Text = $InitialTemplate
+    $templateBox.Multiline = $true
+    $templateBox.AcceptsReturn = $true
+    $templateBox.AcceptsTab = $true
+    $templateBox.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+    $templateBox.WordWrap = $true
+    $templateBox.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $root.Controls.Add($templateBox, 0, 3)
+
+    $buttonPanel = New-Object System.Windows.Forms.Panel
+    $buttonPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $root.Controls.Add($buttonPanel, 0, 4)
+
+    $saveAction = {
+        $newTitle = $titleBox.Text.Trim()
+        $newTemplate = $templateBox.Text
+
+        if ([string]::IsNullOrWhiteSpace($newTitle)) {
+            Show-WarningMessage 'Please enter a display name for this template.' 'Missing name'
+            return
+        }
+        if ([string]::IsNullOrWhiteSpace($newTemplate)) {
+            Show-WarningMessage 'Please enter template text.' 'Missing template'
+            return
+        }
+
+        if ($null -ne $OnSave) {
+            & $OnSave $newTitle $newTemplate
+        }
+        $dialog.Close()
+    }
+
+    if ($ShowDelete) {
+        $deleteButton = New-Object System.Windows.Forms.Button
+        $deleteButton.Text = 'Delete'
+        $deleteButton.Width = 90
+        $deleteButton.Height = 28
+        $deleteButton.Left = 0
+        $deleteButton.Top = 6
+        $deleteButton.BackColor = [System.Drawing.ColorTranslator]::FromHtml('#ffdddd')
+        $deleteButton.UseVisualStyleBackColor = $false
+        $deleteButton.Add_Click({
+            $answer = [System.Windows.Forms.MessageBox]::Show(
+                'Are you sure you want to delete this template?',
+                'Delete template',
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Question
+            )
+            if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) {
+                if ($null -ne $OnDelete) {
+                    & $OnDelete
+                }
+                $dialog.Close()
+            }
+        })
+        $buttonPanel.Controls.Add($deleteButton)
+    }
+
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = 'Cancel'
+    $cancelButton.Width = 90
+    $cancelButton.Height = 28
+    $cancelButton.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+    $cancelButton.Left = $buttonPanel.ClientSize.Width - 90
+    $cancelButton.Top = 6
+    $cancelButton.Add_Click({ $dialog.Close() })
+    $buttonPanel.Controls.Add($cancelButton)
+
+    $saveButton = New-Object System.Windows.Forms.Button
+    $saveButton.Text = 'Save'
+    $saveButton.Width = 90
+    $saveButton.Height = 28
+    $saveButton.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+    $saveButton.Left = $buttonPanel.ClientSize.Width - 188
+    $saveButton.Top = 6
+    $saveButton.Add_Click($saveAction)
+    $buttonPanel.Controls.Add($saveButton)
+
+    $buttonPanel.Add_SizeChanged({
+        $cancelButton.Left = $buttonPanel.ClientSize.Width - $cancelButton.Width
+        $saveButton.Left = $buttonPanel.ClientSize.Width - $cancelButton.Width - 8 - $saveButton.Width
+    })
+
+    $dialog.Add_KeyDown({
+        param($sender, $eventArgs)
+        if ($eventArgs.KeyCode -eq [System.Windows.Forms.Keys]::Escape) {
+            $dialog.Close()
+        }
+        elseif ($eventArgs.Control -and $eventArgs.KeyCode -eq [System.Windows.Forms.Keys]::S) {
+            & $saveAction
+            $eventArgs.SuppressKeyPress = $true
+        }
+    })
+
+    $dialog.Add_Shown({
+        $titleBox.Focus() | Out-Null
+        $titleBox.SelectAll()
+    })
+
+    if ($null -ne $script:MainForm) {
+        $dialog.ShowDialog($script:MainForm) | Out-Null
+    }
+    else {
+        $dialog.ShowDialog() | Out-Null
+    }
+}
+
+function Add-Template {
+    param([string]$Title, [string]$Template)
+
+    $script:Templates = @($script:Templates) + (New-TemplateItem -Id ([guid]::NewGuid().ToString()) -Title $Title -Template $Template)
+    Save-Templates
+    Render-Grid
+    Set-Status "Added template: $Title"
+}
+
+function Update-Template {
+    param(
+        [string]$TemplateId,
+        [string]$Title,
+        [string]$Template
+    )
+
+    foreach ($item in @($script:Templates)) {
+        if ($item.id -eq $TemplateId) {
+            $item.title = $Title
+            $item.template = $Template
+            break
+        }
+    }
+
+    Save-Templates
+    Render-Grid
+    Set-Status "Updated template: $Title"
+}
+
+function Delete-Template {
+    param([string]$TemplateId)
+
+    $before = @($script:Templates).Count
+    $script:Templates = @($script:Templates | Where-Object { $_.id -ne $TemplateId })
+    $after = @($script:Templates).Count
+
+    if ($after -ne $before) {
+        Save-Templates
+        Render-Grid
+        Set-Status 'Deleted template'
+    }
+}
+
+function Open-AddDialog {
+    Show-TemplateDialog `
+        -DialogTitle 'Add Template' `
+        -InitialTitle '' `
+        -InitialTemplate '' `
+        -ShowDelete $false `
+        -OnSave { param($title, $template) Add-Template -Title $title -Template $template }
+}
+
+function Open-EditDialog {
+    param([object]$Item)
+
+    Show-TemplateDialog `
+        -DialogTitle "Edit Template: $($Item.title)" `
+        -InitialTitle ([string]$Item.title) `
+        -InitialTemplate ([string]$Item.template) `
+        -ShowDelete $true `
+        -OnSave { param($title, $template) Update-Template -TemplateId ([string]$Item.id) -Title $title -Template $template } `
+        -OnDelete { Delete-Template -TemplateId ([string]$Item.id) }
+}
+
+function Reload-FromDisk {
+    $script:Templates = @(Load-Templates)
+    Render-Grid
+    Set-Status 'Reloaded templates.json'
+}
+
+function Build-MainForm {
+    $script:MainForm = New-Object System.Windows.Forms.Form
+    $script:MainForm.Text = $script:AppTitle
+    $script:MainForm.Size = New-Object -TypeName System.Drawing.Size -ArgumentList 720, 520
+    $script:MainForm.MinimumSize = New-Object -TypeName System.Drawing.Size -ArgumentList 620, 420
+    $script:MainForm.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+
+    $root = New-Object System.Windows.Forms.TableLayoutPanel
+    $root.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $root.Padding = New-Object -TypeName System.Windows.Forms.Padding -ArgumentList 12
+    $root.ColumnCount = 1
+    $root.RowCount = 4
+    $root.ColumnStyles.Add((New-Object -TypeName System.Windows.Forms.ColumnStyle -ArgumentList ([System.Windows.Forms.SizeType]::Percent), 100)) | Out-Null
+    $root.RowStyles.Add((New-Object -TypeName System.Windows.Forms.RowStyle -ArgumentList ([System.Windows.Forms.SizeType]::Absolute), 36)) | Out-Null
+    $root.RowStyles.Add((New-Object -TypeName System.Windows.Forms.RowStyle -ArgumentList ([System.Windows.Forms.SizeType]::Absolute), 34)) | Out-Null
+    $root.RowStyles.Add((New-Object -TypeName System.Windows.Forms.RowStyle -ArgumentList ([System.Windows.Forms.SizeType]::Percent), 100)) | Out-Null
+    $root.RowStyles.Add((New-Object -TypeName System.Windows.Forms.RowStyle -ArgumentList ([System.Windows.Forms.SizeType]::Absolute), 30)) | Out-Null
+    $script:MainForm.Controls.Add($root)
+
+    $header = New-Object System.Windows.Forms.Panel
+    $header.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $root.Controls.Add($header, 0, 0)
+
+    $titleLabel = New-Object System.Windows.Forms.Label
+    $titleLabel.Text = $script:AppTitle
+    $titleLabel.AutoSize = $true
+    $titleLabel.Font = New-Object -TypeName System.Drawing.Font -ArgumentList 'Segoe UI', 15, ([System.Drawing.FontStyle]::Bold)
+    $titleLabel.Location = New-Object -TypeName System.Drawing.Point -ArgumentList 0, 3
+    $header.Controls.Add($titleLabel)
+
+    $reloadButton = New-Object System.Windows.Forms.Button
+    $reloadButton.Text = 'Reload'
+    $reloadButton.Width = 90
+    $reloadButton.Height = 28
+    $reloadButton.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+    $reloadButton.Left = $header.ClientSize.Width - $reloadButton.Width
+    $reloadButton.Top = 2
+    $reloadButton.Add_Click({ Reload-FromDisk })
+    $header.Controls.Add($reloadButton)
+
+    $header.Add_SizeChanged({
+        $reloadButton.Left = $header.ClientSize.Width - $reloadButton.Width
+    })
+
+    $helpLabel = New-Object System.Windows.Forms.Label
+    $helpLabel.Text = 'Single-click to copy. Double-click to edit or delete. Use + to add a new template.'
+    $helpLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $helpLabel.ForeColor = [System.Drawing.ColorTranslator]::FromHtml('#555555')
+    $helpLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $root.Controls.Add($helpLabel, 0, 1)
+
+    $script:ScrollPanel = New-Object System.Windows.Forms.Panel
+    $script:ScrollPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $script:ScrollPanel.AutoScroll = $true
+    $root.Controls.Add($script:ScrollPanel, 0, 2)
+
+    $script:GridTable = New-Object System.Windows.Forms.TableLayoutPanel
+    $script:GridTable.AutoSize = $false
+    $script:GridTable.Margin = New-Object -TypeName System.Windows.Forms.Padding -ArgumentList 0
+    $script:GridTable.Padding = New-Object -TypeName System.Windows.Forms.Padding -ArgumentList 0
+    $script:GridTable.Location = New-Object -TypeName System.Drawing.Point -ArgumentList 0, 0
+    $script:ScrollPanel.Controls.Add($script:GridTable)
+
+    $script:StatusLabel = New-Object System.Windows.Forms.Label
+    $script:StatusLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $script:StatusLabel.ForeColor = [System.Drawing.ColorTranslator]::FromHtml('#2f6f2f')
+    $script:StatusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $root.Controls.Add($script:StatusLabel, 0, 3)
+
+    $script:ResizeTimer = New-Object System.Windows.Forms.Timer
+    $script:ResizeTimer.Interval = 80
+    $script:ResizeTimer.Add_Tick({
+        $script:ResizeTimer.Stop()
+        $newColumns = Get-GridColumns
+        if ($newColumns -ne $script:CurrentGridColumns) {
+            Render-Grid
+        }
+    })
+
+    $script:ScrollPanel.Add_SizeChanged({
+        if ($null -ne $script:ResizeTimer) {
+            $script:ResizeTimer.Stop()
+            $script:ResizeTimer.Start()
+        }
+    })
+
+    $script:ClickTimer = New-Object System.Windows.Forms.Timer
+    $script:ClickTimer.Interval = $script:SingleClickDelayMs
+    $script:ClickTimer.Add_Tick({
+        $script:ClickTimer.Stop()
+        if ($null -ne $script:PendingClickItem) {
+            $itemToCopy = $script:PendingClickItem
+            $script:PendingClickItem = $null
+            $script:LastClickTemplateId = $null
+            $script:LastClickTime = [DateTime]::MinValue
+            Copy-Template $itemToCopy
+        }
+    })
+
+    $script:Templates = @(Load-Templates)
+    $script:AddButtonImage = New-ScaledImage -Path $script:AddIconFile -Width 42 -Height 42
+    Set-Status "Data file: $script:DataFile"
+    Render-Grid
+}
+
+try {
+    Build-MainForm
+    [System.Windows.Forms.Application]::Run($script:MainForm)
+}
+catch {
+    Show-ErrorMessage "Clipboard Panel failed:`r`n$($_.Exception.Message)" 'Application error'
+    exit 1
+}

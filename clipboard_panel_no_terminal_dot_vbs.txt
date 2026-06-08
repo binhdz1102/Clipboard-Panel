@@ -1,0 +1,20 @@
+Option Explicit
+
+' Clipboard Panel hidden launcher
+' Double-click this file instead of clipboard_panel_bat.bat to start the app without showing a terminal window.
+
+Dim fso, shell, scriptDir, batPath, command
+Set fso = CreateObject("Scripting.FileSystemObject")
+Set shell = CreateObject("WScript.Shell")
+
+scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
+batPath = fso.BuildPath(scriptDir, "clipboard_panel_dot_bat.bat")
+
+If Not fso.FileExists(batPath) Then
+    MsgBox "Cannot find clipboard_panel_dot_bat.bat in:" & vbCrLf & scriptDir, vbCritical, "Clipboard Panel"
+    WScript.Quit 1
+End If
+
+' WindowStyle = 0 means hidden. False means do not wait for the app to close.
+command = "cmd.exe /c " & Chr(34) & Chr(34) & batPath & Chr(34) & Chr(34)
+shell.Run command, 0, False
